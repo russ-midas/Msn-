@@ -17,11 +17,13 @@ import * as Haptics from 'expo-haptics';
 import { format, isToday, isYesterday } from 'date-fns';
 
 import { colors, typography, spacing, borderRadius } from '../../theme';
-import { RetroHeader, Avatar } from '../../components/common';
+import { RetroHeader, Avatar, StatusIndicator } from '../../components/common';
 import { useMessagesStore } from '../../stores/messagesStore';
 import { useContactsStore } from '../../stores/contactsStore';
 import { useSettingsStore } from '../../stores/settingsStore';
-import { Message } from '../../types';
+import { useNudgeStore } from '../../stores/nudgeStore';
+import { getInteractionType, InteractionType } from '../../services/presenceService';
+import { Message, UserStatus } from '../../types';
 import { MainStackParamList } from '../../navigation';
 
 type ChatRouteProp = RouteProp<MainStackParamList, 'Chat'>;
@@ -119,6 +121,62 @@ function MessageBubble({
   );
 }
 
+// Status banner component showing interaction rules
+function StatusBanner({
+  status,
+  interactionType,
+  hoursUntilNudge,
+  displayName,
+}: {
+  status: UserStatus;
+  interactionType: InteractionType;
+  hoursUntilNudge: number | null;
+  displayName: string;
+}) {
+  const getStatusConfig = () => {
+    switch (interactionType) {
+      case 'message':
+        return {
+          color: colors.status.online,
+          icon: 'chatbubble' as const,
+          text: `${displayName} is online - send a message!`,
+        };
+      case 'nudge':
+        return {
+          color: colors.status.away,
+          icon: 'hand-left' as const,
+          text: `${displayName} is away - send a nudge to get their attention`,
+        };
+      case 'nudge_limited':
+        return {
+          color: colors.status.offline,
+          icon: 'hand-left' as const,
+          text: `${displayName} is offline - you can send one nudge`,
+        };
+      case 'none':
+        return {
+          color: colors.status.offline,
+          icon: 'time' as const,
+          text: hoursUntilNudge
+            ? `Already nudged - wait ${hoursUntilNudge}h to nudge again`
+            : `${displayName} is unavailable`,
+        };
+    }
+  };
+
+  const config = getStatusConfig();
+
+  return (
+    <View style={[styles.statusBanner, { backgroundColor: config.color + '20' }]}>
+      <StatusIndicator status={status} size="small" />
+      <Ionicons name={config.icon} size={16} color={config.color} />
+      <Text style={[styles.statusBannerText, { color: config.color }]}>
+        {config.text}
+      </Text>
+    </View>
+  );
+}
+
 export function ChatScreen() {
   const navigation = useNavigation();
   const route = useRoute<ChatRouteProp>();
@@ -129,6 +187,7 @@ export function ChatScreen() {
   const { getMessages, sendMessage, sendNudge, getConversation } = useMessagesStore();
   const { getContactById } = useContactsStore();
   const { showTimestamps, enterToSend } = useSettingsStore();
+  const { recordNudge, getLastNudgeTime, canNudgeOfflineUser, getHoursUntilNextNudge } = useNudgeStore();
 
   const [inputText, setInputText] = useState('');
   const [isTyping, setIsTyping] = useState(false);
@@ -147,7 +206,22 @@ export function ChatScreen() {
   const displayName =
     conversation?.name || displayContact?.displayName || displayContact?.screenName || 'Chat';
 
+  const contactStatus = displayContact?.presence.status || 'offline';
+  const lastNudgeTime = displayContact ? getLastNudgeTime(displayContact.id) : null;
+  const interactionType = getInteractionType(contactStatus, lastNudgeTime);
+  const hoursUntilNudge = displayContact ? getHoursUntilNextNudge(displayContact.id) : null;
+
+  // Determine what actions are available
+  const canMessage = interactionType === 'message';
+  const canNudge = interactionType === 'nudge' || interactionType === 'nudge_limited';
+  const isOfflineNudge = interactionType === 'nudge_limited';
+
   const handleSend = () => {
+    if (!canMessage) {
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+      return;
+    }
+
     if (inputText.trim()) {
       sendMessage(conversationId, inputText.trim());
       setInputText('');
@@ -161,8 +235,23 @@ export function ChatScreen() {
   };
 
   const handleNudge = () => {
+    if (!canNudge) {
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+      return;
+    }
+
+    // Record the nudge (especially important for offline users)
+    if (displayContact) {
+      recordNudge(displayContact.id, isOfflineNudge);
+    }
+
     sendNudge(conversationId, 'user_1');
     Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning);
+
+    // Scroll to bottom
+    setTimeout(() => {
+      flatListRef.current?.scrollToEnd({ animated: true });
+    }, 100);
   };
 
   const handleKeyPress = (e: any) => {
@@ -180,15 +269,17 @@ export function ChatScreen() {
     >
       <RetroHeader
         title={displayName}
-        subtitle={
-          displayContact?.presence.status
-            ? displayContact.presence.customMessage || displayContact.presence.status
-            : undefined
-        }
+        subtitle={contactStatus}
         showBack
         onBackPress={() => navigation.goBack()}
-        rightIcon="call-outline"
-        onRightPress={() => {}}
+      />
+
+      {/* Status Banner - Shows interaction rules */}
+      <StatusBanner
+        status={contactStatus}
+        interactionType={interactionType}
+        hoursUntilNudge={hoursUntilNudge}
+        displayName={displayName}
       />
 
       {/* Messages List */}
@@ -213,13 +304,18 @@ export function ChatScreen() {
           <View style={styles.emptyChat}>
             <Avatar
               name={displayName}
-              status={displayContact?.presence.status}
+              status={contactStatus}
               size="large"
-              showStatus={false}
             />
-            <Text style={styles.emptyChatTitle}>Start a conversation!</Text>
+            <Text style={styles.emptyChatTitle}>
+              {canMessage ? 'Start a conversation!' : 'Waiting for them...'}
+            </Text>
             <Text style={styles.emptyChatSubtitle}>
-              Say hello to {displayName} 👋
+              {canMessage
+                ? `Say hello to ${displayName} 👋`
+                : canNudge
+                ? `Send a nudge to let ${displayName} know you're here`
+                : `${displayName} is offline`}
             </Text>
           </View>
         }
@@ -232,57 +328,75 @@ export function ChatScreen() {
         </View>
       )}
 
-      {/* Input Area */}
+      {/* Input Area - Conditional based on interaction type */}
       <View style={[styles.inputContainer, { paddingBottom: insets.bottom || spacing.md }]}>
-        <View style={styles.inputRow}>
-          {/* Nudge Button - Classic MSN feature! */}
+        {canMessage ? (
+          // Online - Show full messaging UI
+          <View style={styles.inputRow}>
+            <TouchableOpacity style={styles.iconButton} activeOpacity={0.7}>
+              <Ionicons name="happy-outline" size={24} color={colors.text.muted} />
+            </TouchableOpacity>
+
+            <TextInput
+              style={styles.input}
+              value={inputText}
+              onChangeText={setInputText}
+              placeholder="Type a message..."
+              placeholderTextColor={colors.text.muted}
+              multiline
+              maxLength={2000}
+              onKeyPress={handleKeyPress}
+            />
+
+            <TouchableOpacity style={styles.iconButton} activeOpacity={0.7}>
+              <Ionicons name="image-outline" size={24} color={colors.text.muted} />
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={[
+                styles.sendButton,
+                inputText.trim() && styles.sendButtonActive,
+              ]}
+              onPress={handleSend}
+              disabled={!inputText.trim()}
+              activeOpacity={0.7}
+            >
+              <Ionicons
+                name="send"
+                size={20}
+                color={inputText.trim() ? colors.text.primary : colors.text.muted}
+              />
+            </TouchableOpacity>
+          </View>
+        ) : canNudge ? (
+          // Away or Offline (with nudge available) - Show nudge UI
           <TouchableOpacity
-            style={styles.nudgeButton}
+            style={styles.nudgeFullButton}
             onPress={handleNudge}
             activeOpacity={0.7}
           >
-            <Ionicons name="hand-left" size={24} color={colors.aim.primary} />
+            <Ionicons name="hand-left" size={28} color={colors.aim.primary} />
+            <View style={styles.nudgeButtonContent}>
+              <Text style={styles.nudgeButtonTitle}>Send a Nudge</Text>
+              <Text style={styles.nudgeButtonSubtitle}>
+                {isOfflineNudge
+                  ? 'Let them know you want to chat (1 per 24h)'
+                  : 'Get their attention!'}
+              </Text>
+            </View>
+            <Ionicons name="chevron-forward" size={24} color={colors.aim.primary} />
           </TouchableOpacity>
-
-          {/* Emoji Button */}
-          <TouchableOpacity style={styles.iconButton} activeOpacity={0.7}>
-            <Ionicons name="happy-outline" size={24} color={colors.text.muted} />
-          </TouchableOpacity>
-
-          {/* Text Input */}
-          <TextInput
-            style={styles.input}
-            value={inputText}
-            onChangeText={setInputText}
-            placeholder="Type a message..."
-            placeholderTextColor={colors.text.muted}
-            multiline
-            maxLength={2000}
-            onKeyPress={handleKeyPress}
-          />
-
-          {/* Image Button */}
-          <TouchableOpacity style={styles.iconButton} activeOpacity={0.7}>
-            <Ionicons name="image-outline" size={24} color={colors.text.muted} />
-          </TouchableOpacity>
-
-          {/* Send Button */}
-          <TouchableOpacity
-            style={[
-              styles.sendButton,
-              inputText.trim() && styles.sendButtonActive,
-            ]}
-            onPress={handleSend}
-            disabled={!inputText.trim()}
-            activeOpacity={0.7}
-          >
-            <Ionicons
-              name="send"
-              size={20}
-              color={inputText.trim() ? colors.text.primary : colors.text.muted}
-            />
-          </TouchableOpacity>
-        </View>
+        ) : (
+          // No interaction available
+          <View style={styles.noInteractionContainer}>
+            <Ionicons name="time-outline" size={24} color={colors.text.muted} />
+            <Text style={styles.noInteractionText}>
+              {hoursUntilNudge
+                ? `You've already nudged ${displayName}. Try again in ${hoursUntilNudge}h.`
+                : `${displayName} is unavailable right now.`}
+            </Text>
+          </View>
+        )}
       </View>
     </KeyboardAvoidingView>
   );
@@ -292,6 +406,19 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: colors.ui.background,
+  },
+  statusBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: spacing.sm,
+    paddingHorizontal: spacing.md,
+    gap: spacing.sm,
+    borderBottomWidth: 1,
+    borderBottomColor: colors.ui.border,
+  },
+  statusBannerText: {
+    ...typography.bodySmall,
+    flex: 1,
   },
   messagesList: {
     padding: spacing.md,
@@ -372,6 +499,8 @@ const styles = StyleSheet.create({
     ...typography.body,
     color: colors.text.muted,
     marginTop: spacing.xs,
+    textAlign: 'center',
+    paddingHorizontal: spacing.xl,
   },
   typingIndicator: {
     paddingHorizontal: spacing.md,
@@ -393,14 +522,6 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'flex-end',
     gap: spacing.xs,
-  },
-  nudgeButton: {
-    width: 44,
-    height: 44,
-    justifyContent: 'center',
-    alignItems: 'center',
-    backgroundColor: colors.ui.surfaceLight,
-    borderRadius: borderRadius.full,
   },
   iconButton: {
     width: 44,
@@ -429,5 +550,40 @@ const styles = StyleSheet.create({
   },
   sendButtonActive: {
     backgroundColor: colors.msn.primary,
+  },
+  nudgeFullButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: colors.aim.primary + '15',
+    borderRadius: borderRadius.lg,
+    padding: spacing.md,
+    gap: spacing.md,
+    borderWidth: 2,
+    borderColor: colors.aim.primary + '40',
+  },
+  nudgeButtonContent: {
+    flex: 1,
+  },
+  nudgeButtonTitle: {
+    ...typography.screenName,
+    color: colors.aim.primary,
+  },
+  nudgeButtonSubtitle: {
+    ...typography.caption,
+    color: colors.text.muted,
+    marginTop: 2,
+  },
+  noInteractionContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: spacing.md,
+    gap: spacing.sm,
+  },
+  noInteractionText: {
+    ...typography.bodySmall,
+    color: colors.text.muted,
+    textAlign: 'center',
+    flex: 1,
   },
 });
